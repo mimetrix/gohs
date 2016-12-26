@@ -2,18 +2,20 @@ package hyperscan
 
 import (
 	"errors"
+	"fmt"
+	"os"
 )
 
 var (
 	errTooManyMatches = errors.New("too many matches")
 )
 
-// A Hyperscan scratch space.
+// Scratch is Hyperscan's scratch space.
 type Scratch struct {
 	s hsScratch
 }
 
-// Allocate a "scratch" space for use by Hyperscan.
+// NewScratch allocates a "scratch" space for use by Hyperscan.
 // This is required for runtime use, and one scratch space per thread,
 // or concurrent caller, is required.
 func NewScratch(db Database) (*Scratch, error) {
@@ -26,10 +28,10 @@ func NewScratch(db Database) (*Scratch, error) {
 	return &Scratch{s}, nil
 }
 
-// Provides the size of the given scratch space.
+// Size provides the size of the given scratch space.
 func (s *Scratch) Size() (int, error) { return hsScratchSize(s.s) }
 
-// Reallocate the scratch for another database.
+// Realloc reallocates the scratch for another database.
 func (s *Scratch) Realloc(db Database) error {
 	if err := hsReallocScratch(db.(database).Db(), &s.s); err != nil {
 		return err
@@ -38,7 +40,7 @@ func (s *Scratch) Realloc(db Database) error {
 	return nil
 }
 
-// Allocate a scratch space that is a clone of an existing scratch space.
+// Clone allocates a scratch space that is a clone of an existing scratch space.
 func (s *Scratch) Clone() (*Scratch, error) {
 	cloned, err := hsCloneScratch(s.s)
 
@@ -52,6 +54,7 @@ func (s *Scratch) Clone() (*Scratch, error) {
 // Free a scratch block previously allocated
 func (s *Scratch) Free() error { return hsFreeScratch(s.s) }
 
+// MatchContext assembles a DB, it's scratch space and user context
 type MatchContext interface {
 	Database() Database
 
@@ -60,6 +63,7 @@ type MatchContext interface {
 	UserData() interface{}
 }
 
+// MatchEvent is produced for each match
 type MatchEvent interface {
 	Id() uint
 
@@ -70,14 +74,16 @@ type MatchEvent interface {
 	Flags() ScanFlag
 }
 
+// MatchHandler is the identity of the function handling matches
 type MatchHandler hsMatchEventHandler
 
-// The block (non-streaming) regular expression scanner.
+// BlockScanner is the block (non-streaming) regular expression scanner.
 type BlockScanner interface {
 	// This is the function call in which the actual pattern matching takes place for block-mode pattern databases.
 	Scan(data []byte, scratch *Scratch, handler MatchHandler, context interface{}) error
 }
 
+// BlockMatcher handles matches for a BlockScanner
 type BlockMatcher interface {
 	// Find returns a slice holding the text of the leftmost match in b of the regular expression.
 	// A return value of nil indicates no match.
@@ -216,15 +222,23 @@ func (vs *vectoredScanner) Scan(data [][]byte, s *Scratch, handler MatchHandler,
 }
 
 type blockScanner struct {
-	bdb *blockDatabase
+	bdb     *blockDatabase
+	scratch *Scratch
 }
 
 func newBlockScanner(bdb *blockDatabase) *blockScanner {
-	return &blockScanner{bdb}
+	scratch, err := NewScratch(bdb)
+
+	if err != nil {
+		fmt.Fprint(os.Stderr, "ERROR: Unable to allocate scratch space. Exiting.\n")
+		os.Exit(-1)
+	}
+
+	return &blockScanner{bdb, scratch}
 }
 
 func (bs *blockScanner) Scan(data []byte, s *Scratch, handler MatchHandler, context interface{}) error {
-	err := hsScan(bs.bdb.db, data, 0, s.s, hsMatchEventHandler(handler), context)
+	err := hsScan(bs.bdb.db, data, 0, bs.scratch.s, hsMatchEventHandler(handler), context)
 
 	if err != nil {
 		return err
@@ -248,7 +262,7 @@ func (m *blockMatcher) Close() error {
 }
 
 func (m *blockMatcher) Handle(id uint, from, to uint64, flags uint, context interface{}) error {
-	m.n -= 1
+	m.n--
 
 	if m.n == 0 {
 		m.handler.err = errTooManyMatches
@@ -258,6 +272,7 @@ func (m *blockMatcher) Handle(id uint, from, to uint64, flags uint, context inte
 }
 
 func (m *blockMatcher) scan(data []byte) error {
+	m.handler.Reset()
 	if err := m.scanner.Scan(data, nil, m.handler.Handle, nil); err != nil {
 		return err
 	}
@@ -328,7 +343,7 @@ func (m *blockMatcher) Match(data []byte) bool {
 
 	err := m.scan(data)
 
-	return err != nil && err.(HsError) == ErrScanTerminated
+	return (err == nil || err.(HsError) == ErrScanTerminated) && len(m.handler.matched) > 0
 }
 
 func (m *blockMatcher) MatchString(s string) bool {

@@ -31,6 +31,10 @@ func (h *matchRecorder) Handle(id uint, from, to uint64, flags uint, context int
 	return h.err
 }
 
+func (h *matchRecorder) Reset() {
+	h.matched = h.matched[:0]
+}
+
 func Match(pattern string, data []byte) (bool, error) {
 	var result *multierror.Error
 
