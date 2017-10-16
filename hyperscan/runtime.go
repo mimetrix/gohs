@@ -10,12 +10,12 @@ var (
 	errTooManyMatches = errors.New("too many matches")
 )
 
-// Scratch is Hyperscan's scratch space.
+// Scratch is a Hyperscan scratch space.
 type Scratch struct {
 	s hsScratch
 }
 
-// NewScratch allocates a "scratch" space for use by Hyperscan.
+// NewScratch allocate a "scratch" space for use by Hyperscan.
 // This is required for runtime use, and one scratch space per thread,
 // or concurrent caller, is required.
 func NewScratch(db Database) (*Scratch, error) {
@@ -31,16 +31,12 @@ func NewScratch(db Database) (*Scratch, error) {
 // Size provides the size of the given scratch space.
 func (s *Scratch) Size() (int, error) { return hsScratchSize(s.s) }
 
-// Realloc reallocates the scratch for another database.
+// Realloc reallocate the scratch for another database.
 func (s *Scratch) Realloc(db Database) error {
-	if err := hsReallocScratch(db.(database).Db(), &s.s); err != nil {
-		return err
-	}
-
-	return nil
+	return hsReallocScratch(db.(database).Db(), &s.s)
 }
 
-// Clone allocates a scratch space that is a clone of an existing scratch space.
+// Clone allocate a scratch space that is a clone of an existing scratch space.
 func (s *Scratch) Clone() (*Scratch, error) {
 	cloned, err := hsCloneScratch(s.s)
 
@@ -83,7 +79,7 @@ type BlockScanner interface {
 	Scan(data []byte, scratch *Scratch, handler MatchHandler, context interface{}) error
 }
 
-// BlockMatcher handles matches for a BlockScanner
+// BlockMatcher implements regular expression search.
 type BlockMatcher interface {
 	// Find returns a slice holding the text of the leftmost match in b of the regular expression.
 	// A return value of nil indicates no match.
@@ -125,6 +121,7 @@ type BlockMatcher interface {
 	MatchString(s string) bool
 }
 
+// Stream exist in the Hyperscan library so that pattern matching state can be maintained across multiple blocks of target data
 type Stream interface {
 	Scan(data []byte) error
 
@@ -135,19 +132,21 @@ type Stream interface {
 	Clone() (Stream, error)
 }
 
-// The streaming regular expression scanner.
+// StreamScanner is the streaming regular expression scanner.
 type StreamScanner interface {
 	Open(flags ScanFlag, scratch *Scratch, handler MatchHandler, context interface{}) (Stream, error)
 }
 
+// StreamMatcher implements regular expression search.
 type StreamMatcher interface {
 }
 
-// The vectored regular expression scanner.
+// VectoredScanner is the vectored regular expression scanner.
 type VectoredScanner interface {
 	Scan(data [][]byte, scratch *Scratch, handler MatchHandler, context interface{}) error
 }
 
+// VectoredMatcher implements regular expression search.
 type VectoredMatcher interface {
 }
 
@@ -172,47 +171,69 @@ func (s *stream) Reset() error {
 }
 
 func (s *stream) Clone() (Stream, error) {
-	if ss, err := hsCopyStream(s.stream); err != nil {
+	ss, err := hsCopyStream(s.stream)
+
+	if err != nil {
 		return nil, err
-	} else {
-		return &stream{ss, s.flags, s.scratch, s.handler, s.context}, nil
 	}
+
+	return &stream{ss, s.flags, s.scratch, s.handler, s.context}, nil
 }
 
 type streamScanner struct {
-	sdb *streamDatabase
+	*baseDatabase
 }
 
-func newStreamScanner(sdb *streamDatabase) *streamScanner {
-	return &streamScanner{sdb}
+func newStreamScanner(db *baseDatabase) *streamScanner {
+	return &streamScanner{baseDatabase: db}
 }
 
-func (s *streamScanner) Close() error {
+func (ss *streamScanner) Close() error {
 	return nil
 }
 
 func (ss *streamScanner) Open(flags ScanFlag, sc *Scratch, handler MatchHandler, context interface{}) (Stream, error) {
-	s, err := hsOpenStream(ss.sdb.db, flags)
+	s, err := hsOpenStream(ss.db, flags)
 
 	if err != nil {
 		return nil, err
+	}
+
+	if sc == nil {
+		sc, err = NewScratch(ss)
+
+		if err != nil {
+			return nil, err
+		}
+
+		defer sc.Free()
 	}
 
 	return &stream{s, flags, sc.s, hsMatchEventHandler(handler), context}, nil
 }
 
 type vectoredScanner struct {
-	vdb *vectoredDatabase
+	*baseDatabase
 }
 
-func newVectoredScanner(vdb *vectoredDatabase) *vectoredScanner {
+func newVectoredScanner(vdb *baseDatabase) *vectoredScanner {
 	return &vectoredScanner{vdb}
 }
 
-func (s *vectoredScanner) Close() error { return nil }
+func (vs *vectoredScanner) Close() error { return nil }
 
-func (vs *vectoredScanner) Scan(data [][]byte, s *Scratch, handler MatchHandler, context interface{}) error {
-	err := hsScanVector(vs.vdb.db, data, 0, s.s, hsMatchEventHandler(handler), context)
+func (vs *vectoredScanner) Scan(data [][]byte, s *Scratch, handler MatchHandler, context interface{}) (err error) {
+	if s == nil {
+		s, err = NewScratch(vs)
+
+		if err != nil {
+			return err
+		}
+
+		defer s.Free()
+	}
+
+	err = hsScanVector(vs.db, data, 0, s.s, hsMatchEventHandler(handler), context)
 
 	if err != nil {
 		return err
@@ -222,43 +243,46 @@ func (vs *vectoredScanner) Scan(data [][]byte, s *Scratch, handler MatchHandler,
 }
 
 type blockScanner struct {
-	bdb     *blockDatabase
+	*baseDatabase
 	scratch *Scratch
 }
 
-func newBlockScanner(bdb *blockDatabase) *blockScanner {
+func newBlockScanner(bdb *baseDatabase) *blockScanner {
 	scratch, err := NewScratch(bdb)
 
+	// TODO better handle errors
 	if err != nil {
 		fmt.Fprint(os.Stderr, "ERROR: Unable to allocate scratch space. Exiting.\n")
 		os.Exit(-1)
 	}
 
-	return &blockScanner{bdb, scratch}
+	return &blockScanner{baseDatabase: bdb, scratch: scratch}
 }
 
 func (bs *blockScanner) Scan(data []byte, s *Scratch, handler MatchHandler, context interface{}) error {
-	err := hsScan(bs.bdb.db, data, 0, bs.scratch.s, hsMatchEventHandler(handler), context)
-
-	if err != nil {
-		return err
+	if s == nil {
+		s = bs.scratch
 	}
+	if s == nil {
+		s, err := NewScratch(bs)
 
-	return nil
+		if err != nil {
+			return err
+		}
+
+		defer s.Free()
+	}
+	return hsScan(bs.db, data, 0, s.s, hsMatchEventHandler(handler), context)
 }
 
 type blockMatcher struct {
-	scanner *blockScanner
+	*blockScanner
 	handler *matchRecorder
 	n       int
 }
 
 func newBlockMatcher(scanner *blockScanner) *blockMatcher {
-	return &blockMatcher{scanner: scanner, handler: &matchRecorder{}}
-}
-
-func (m *blockMatcher) Close() error {
-	return nil
+	return &blockMatcher{blockScanner: scanner}
 }
 
 func (m *blockMatcher) Handle(id uint, from, to uint64, flags uint, context interface{}) error {
@@ -272,12 +296,13 @@ func (m *blockMatcher) Handle(id uint, from, to uint64, flags uint, context inte
 }
 
 func (m *blockMatcher) scan(data []byte) error {
-	m.handler.Reset()
-	if err := m.scanner.Scan(data, nil, m.handler.Handle, nil); err != nil {
-		return err
+	if m.handler == nil {
+		m.handler = &matchRecorder{}
+	} else {
+		m.handler.Reset()
 	}
 
-	return nil
+	return m.blockScanner.Scan(data, nil, m.Handle, nil)
 }
 
 func (m *blockMatcher) Find(data []byte) []byte {
@@ -351,21 +376,17 @@ func (m *blockMatcher) MatchString(s string) bool {
 }
 
 type streamMatcher struct {
-	scanner *streamScanner
+	*streamScanner
 }
 
 func newStreamMatcher(scanner *streamScanner) *streamMatcher {
-	return &streamMatcher{scanner: scanner}
+	return &streamMatcher{streamScanner: scanner}
 }
 
-func (m *streamMatcher) Close() error { return m.scanner.Close() }
-
 type vectoredMatcher struct {
-	scanner *vectoredScanner
+	*vectoredScanner
 }
 
 func newVectoredMatcher(scanner *vectoredScanner) *vectoredMatcher {
-	return &vectoredMatcher{scanner: scanner}
+	return &vectoredMatcher{vectoredScanner: scanner}
 }
-
-func (m *vectoredMatcher) Close() error { return m.scanner.Close() }
